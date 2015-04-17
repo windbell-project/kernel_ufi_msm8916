@@ -28,6 +28,7 @@ PROPERTIES
 			"qcom,msm8226-saw2-v2.1-cpu"
 			"qcom,msm8974-saw2-v2.1-cpu"
 			"qcom,apq8084-saw2-v2.1-cpu"
+			"qcom,msm8916-saw2-v3.0-cpu"
 
 - reg:
 	Usage: required
