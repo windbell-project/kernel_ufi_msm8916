@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_V4L2LOOPBACK
+	tristate "v4l2loopback driver"
+	help
+	  Enable v4l2loopback support, it allows to create "virtual video devices". 
+	  Normal (v4l2) applications will read these devices as if they were ordinary video devices.
