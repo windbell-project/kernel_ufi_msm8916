@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2021-2022 HandsomeYingyan <handsomeyingyan@gmail.com>
+ *
+ */
+ 
+/dts-v1/;
+#include "msm8916-handsome-openstick-common.dtsi"
+
+/ {
+	model = "MSM8916 UF629";
+	compatible = "handsome,openstick", "qcom,msm8916";
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		autorepeat;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&gpio_keys_default>;
+		label = "GPIO Buttons";
+
+		reset {
+			label = "Restart";
+			gpios = <&msmgpio 35 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	leds {
+		pinctrl-names = "default";
+		pinctrl-0 = <&msmgpio_leds>;
+
+		compatible = "gpio-leds";
+
+			red {
+				gpios = <&msmgpio 82 GPIO_ACTIVE_HIGH>;
+				label = "red";
+				linux,default-trigger = "default-on";
+				default-state = "on";
+				retain-state-suspended;
+			};
+
+			green {
+				gpios = <&msmgpio 83 GPIO_ACTIVE_HIGH>;
+				label = "green";
+				linux,default-trigger = "default-on";
+				default-state = "on";
+				retain-state-suspended;
+			};
+
+			blue {
+				gpios = <&msmgpio 81 GPIO_ACTIVE_HIGH>;
+				label = "blue";
+				linux,default-trigger = "default-on";
+				default-state = "on";
+			};
+
+	};
+};
+
+&msmgpio {
+	msmgpio_leds: msmgpio-leds {
+		pins = "gpio8","gpio9","gpio10","gpio16","gpio17","gpio18","gpio77","gpio78","gpio81","gpio82","gpio83","gpio84";
+		function = "gpio";
+
+		bias-disabled;
+	};
+
+	gpio_keys_default: gpio_keys_default {
+		pins = "gpio35";
+		function = "gpio";
+
+		drive-strength = <8>;
+		input-enable;
+		bias-pull-up;
+	};
+};
