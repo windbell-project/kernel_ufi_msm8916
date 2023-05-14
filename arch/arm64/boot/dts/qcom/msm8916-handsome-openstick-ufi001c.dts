@@ -37,20 +37,21 @@
 		wifi {
 			label = "blue:wifi";
 			gpios = <&msmgpio 20 GPIO_ACTIVE_HIGH>;
-			linux,default-trigger = "phy0tx";
-			default-state = "off";
+			linux,default-trigger = "default-on";
+			default-state = "on";
 		};
 
 		led_internet: internet {
 			label = "green:internet";
 			gpios = <&msmgpio 21 GPIO_ACTIVE_HIGH>;
-			default-state = "off";
+			linux,default-trigger = "default-on";
+			default-state = "on";
 		};
 
 		os {
 			label = "red:os";
 			gpios = <&msmgpio 22 GPIO_ACTIVE_HIGH>;
-			linux,default-trigger = "heartbeat";
+			linux,default-trigger = "default-on";
 			default-state = "on";
 		};
 
