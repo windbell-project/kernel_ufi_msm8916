@@ -1801,6 +1801,9 @@ static u64 __kvm_read_sanitised_id_reg(const struct kvm_vcpu *vcpu,
 		       ID_AA64MMFR3_EL1_SCTLRX |
 		       ID_AA64MMFR3_EL1_S1POE |
 		       ID_AA64MMFR3_EL1_S1PIE;
+
+		if (!system_supports_poe())
+			val &= ~ID_AA64MMFR3_EL1_S1POE;
 		break;
 	case SYS_ID_MMFR4_EL1:
 		val &= ~ID_MMFR4_EL1_CCIDX;
@@ -5609,7 +5612,11 @@ int kvm_finalize_sys_regs(struct kvm_vcpu *vcpu)
 
 	guard(mutex)(&kvm->arch.config_lock);
 
-	if (!irqchip_in_kernel(kvm)) {
+	/*
+	 * This hacks into the ID registers, so only perform it when the
+	 * first vcpu runs, or the kvm_set_vm_id_reg() helper will scream.
+	 */
+	if (!irqchip_in_kernel(kvm) && !kvm_vm_has_ran_once(kvm)) {
 		u64 val;
 
 		val = kvm_read_vm_id_reg(kvm, SYS_ID_AA64PFR0_EL1) & ~ID_AA64PFR0_EL1_GIC;

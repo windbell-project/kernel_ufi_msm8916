@@ -1363,6 +1363,8 @@ void dm_submit_bio_remap(struct bio *clone, struct bio *tgt_clone)
 	if (!tgt_clone)
 		tgt_clone = clone;
 
+	bio_clone_blkg_association(tgt_clone, io->orig_bio);
+
 	/*
 	 * Account io->origin_bio to DM dev on behalf of target
 	 * that took ownership of IO with DM_MAPIO_SUBMITTED.
@@ -2005,7 +2007,7 @@ static void dm_split_and_process_bio(struct mapped_device *md,
 		 * linear target or multiple linear targets pointing to the same
 		 * device), we can send the flush with data directly to it.
 		 */
-		if (map->flush_bypasses_map) {
+		if (bio->bi_iter.bi_size && map->flush_bypasses_map) {
 			struct list_head *devices = dm_table_get_devices(map);
 			if (devices->next == devices->prev)
 				goto send_preflush_with_data;
@@ -2361,7 +2363,8 @@ static struct mapped_device *alloc_dev(int minor)
 
 	format_dev_t(md->name, MKDEV(_major, minor));
 
-	md->wq = alloc_workqueue("kdmflush/%s", WQ_MEM_RECLAIM, 0, md->name);
+	md->wq = alloc_workqueue("kdmflush/%s", WQ_MEM_RECLAIM | WQ_PERCPU, 0,
+				 md->name);
 	if (!md->wq)
 		goto bad;
 

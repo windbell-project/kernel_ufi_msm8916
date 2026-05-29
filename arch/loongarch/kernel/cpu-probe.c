@@ -7,6 +7,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/ptrace.h>
+#include <linux/cpu.h>
 #include <linux/smp.h>
 #include <linux/stddef.h>
 #include <linux/export.h>
@@ -277,7 +278,7 @@ static inline void cpu_probe_loongson(struct cpuinfo_loongarch *c, unsigned int 
 	uint32_t config;
 	uint64_t *vendor = (void *)(&cpu_full_name[VENDOR_OFFSET]);
 	uint64_t *cpuname = (void *)(&cpu_full_name[CPUNAME_OFFSET]);
-	const char *core_name = "Unknown";
+	const char *core_name = id_to_core_name(c->processor_id);
 
 	switch (BIT(fls(c->isa_level) - 1)) {
 	case LOONGARCH_CPU_ISA_LA32R:
@@ -291,34 +292,22 @@ static inline void cpu_probe_loongson(struct cpuinfo_loongarch *c, unsigned int 
 		break;
 	}
 
-	switch (c->processor_id & PRID_SERIES_MASK) {
-	case PRID_SERIES_LA132:
-		core_name = "LA132";
-		break;
-	case PRID_SERIES_LA264:
-		core_name = "LA264";
-		break;
-	case PRID_SERIES_LA364:
-		core_name = "LA364";
-		break;
-	case PRID_SERIES_LA464:
-		core_name = "LA464";
-		break;
-	case PRID_SERIES_LA664:
-		core_name = "LA664";
-		break;
-	}
-
 	pr_info("%s Processor probed (%s Core)\n", __cpu_family[cpu], core_name);
 
-	if (!cpu_has_iocsr)
+	if (!cpu_has_iocsr) {
+		__cpu_full_name[cpu] = "Unknown";
 		return;
-
-	if (!__cpu_full_name[cpu])
-		__cpu_full_name[cpu] = cpu_full_name;
+	}
 
 	*vendor = iocsr_read64(LOONGARCH_IOCSR_VENDOR);
 	*cpuname = iocsr_read64(LOONGARCH_IOCSR_CPUNAME);
+
+	if (!__cpu_full_name[cpu]) {
+		if (((char *)vendor)[0] == 0)
+			__cpu_full_name[cpu] = "Unknown";
+		else
+			__cpu_full_name[cpu] = cpu_full_name;
+	}
 
 	config = iocsr_read32(LOONGARCH_IOCSR_FEATURES);
 	if (config & IOCSRF_CSRIPI)
@@ -398,4 +387,10 @@ void cpu_probe(void)
 #endif
 
 	cpu_report();
+}
+
+ssize_t cpu_show_spectre_v1(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "Mitigation: __user pointer sanitization\n");
 }

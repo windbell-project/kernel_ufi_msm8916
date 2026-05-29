@@ -43,7 +43,7 @@ __ksft_status_merge()
 		weights[$i]=$((weight++))
 	done
 
-	if [[ ${weights[$a]} > ${weights[$b]} ]]; then
+	if [[ ${weights[$a]} -ge ${weights[$b]} ]]; then
 		echo "$a"
 		return 0
 	else
@@ -576,7 +576,7 @@ ip_link_has_flag()
 	local flag=$1; shift
 
 	local state=$(ip -j link show "$name" |
-		      jq --arg flag "$flag" 'any(.[].flags.[]; . == $flag)')
+		      jq --arg flag "$flag" 'any(.[].flags[]; . == $flag)')
 	[[ $state == true ]]
 }
 

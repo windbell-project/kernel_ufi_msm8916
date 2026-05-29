@@ -3407,7 +3407,17 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 	struct dc_commit_streams_params commit_params = {};
 
 	if (dm->dc->caps.ips_support) {
+		if (!amdgpu_in_reset(adev))
+			mutex_lock(&dm->dc_lock);
+
+		/* Need to set POWER_STATE_D0 first or it will not execute
+		 * idle_power_optimizations command to DMUB.
+		 */
+		dc_dmub_srv_set_power_state(dm->dc->ctx->dmub_srv, DC_ACPI_CM_POWER_STATE_D0);
 		dc_dmub_srv_apply_idle_power_optimizations(dm->dc, false);
+
+		if (!amdgpu_in_reset(adev))
+			mutex_unlock(&dm->dc_lock);
 	}
 
 	if (amdgpu_in_reset(adev)) {
@@ -3812,8 +3822,9 @@ void amdgpu_dm_update_connector_after_detect(
 
 		aconnector->dc_sink = sink;
 		dc_sink_retain(aconnector->dc_sink);
+		drm_edid_free(aconnector->drm_edid);
+		aconnector->drm_edid = NULL;
 		if (sink->dc_edid.length == 0) {
-			aconnector->drm_edid = NULL;
 			hdmi_cec_unset_edid(aconnector);
 			if (aconnector->dc_link->aux_mode) {
 				drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
@@ -3859,6 +3870,97 @@ void amdgpu_dm_update_connector_after_detect(
 	update_subconnector_property(aconnector);
 }
 
+static bool are_sinks_equal(const struct dc_sink *sink1, const struct dc_sink *sink2)
+{
+	if (!sink1 || !sink2)
+		return false;
+	if (sink1->sink_signal != sink2->sink_signal)
+		return false;
+
+	if (sink1->dc_edid.length != sink2->dc_edid.length)
+		return false;
+
+	if (memcmp(sink1->dc_edid.raw_edid, sink2->dc_edid.raw_edid,
+		   sink1->dc_edid.length) != 0)
+		return false;
+	return true;
+}
+
+
+/**
+ * DOC: hdmi_hpd_debounce_work
+ *
+ * HDMI HPD debounce delay in milliseconds. When an HDMI display toggles HPD
+ * (such as during power save transitions), this delay determines how long to
+ * wait before processing the HPD event. This allows distinguishing between a
+ * physical unplug (>hdmi_hpd_debounce_delay)
+ * and a spontaneous RX HPD toggle (<hdmi_hpd_debounce_delay).
+ *
+ * If the toggle is less than this delay, the driver compares sink capabilities
+ * and permits a hotplug event if they changed.
+ *
+ * The default value of 1500ms was chosen based on experimental testing with
+ * various monitors that exhibit spontaneous HPD toggling behavior.
+ */
+static void hdmi_hpd_debounce_work(struct work_struct *work)
+{
+	struct amdgpu_dm_connector *aconnector =
+		container_of(to_delayed_work(work), struct amdgpu_dm_connector,
+			     hdmi_hpd_debounce_work);
+	struct drm_connector *connector = &aconnector->base;
+	struct drm_device *dev = connector->dev;
+	struct amdgpu_device *adev = drm_to_adev(dev);
+	struct dc *dc = aconnector->dc_link->ctx->dc;
+	bool fake_reconnect = false;
+	bool reallow_idle = false;
+	bool ret = false;
+	guard(mutex)(&aconnector->hpd_lock);
+
+	/* Re-detect the display */
+	scoped_guard(mutex, &adev->dm.dc_lock) {
+		if (dc->caps.ips_support && dc->ctx->dmub_srv->idle_allowed) {
+			dc_allow_idle_optimizations(dc, false);
+			reallow_idle = true;
+		}
+		ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD);
+	}
+
+	if (ret) {
+		/* Apply workaround delay for certain panels */
+		apply_delay_after_dpcd_poweroff(adev, aconnector->dc_sink);
+		/* Compare sinks to determine if this was a spontaneous HPD toggle */
+		if (are_sinks_equal(aconnector->dc_link->local_sink, aconnector->hdmi_prev_sink)) {
+			/*
+			* Sinks match - this was a spontaneous HDMI HPD toggle.
+			*/
+			drm_dbg_kms(dev, "HDMI HPD: Sink unchanged after debounce, internal re-enable\n");
+			fake_reconnect = true;
+		}
+
+		/* Update connector state */
+		amdgpu_dm_update_connector_after_detect(aconnector);
+
+		drm_modeset_lock_all(dev);
+		dm_restore_drm_connector_state(dev, connector);
+		drm_modeset_unlock_all(dev);
+
+		/* Only notify OS if sink actually changed */
+		if (!fake_reconnect && aconnector->base.force == DRM_FORCE_UNSPECIFIED)
+			drm_kms_helper_hotplug_event(dev);
+	}
+
+	/* Release the cached sink reference */
+	if (aconnector->hdmi_prev_sink) {
+		dc_sink_release(aconnector->hdmi_prev_sink);
+		aconnector->hdmi_prev_sink = NULL;
+	}
+
+	scoped_guard(mutex, &adev->dm.dc_lock) {
+		if (reallow_idle && dc->caps.ips_support)
+			dc_allow_idle_optimizations(dc, true);
+	}
+}
+
 static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 {
 	struct drm_connector *connector = &aconnector->base;
@@ -3868,6 +3970,7 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 	struct dm_connector_state *dm_con_state = to_dm_connector_state(connector->state);
 	struct dc *dc = aconnector->dc_link->ctx->dc;
 	bool ret = false;
+	bool debounce_required = false;
 
 	if (adev->dm.disable_hpd_irq)
 		return;
@@ -3890,6 +3993,14 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 	if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
 		drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
 
+	/*
+	 * Check for HDMI disconnect with debounce enabled.
+	 */
+	debounce_required = (aconnector->hdmi_hpd_debounce_delay_ms > 0 &&
+			      dc_is_hdmi_signal(aconnector->dc_link->connector_signal) &&
+			      new_connection_type == dc_connection_none &&
+			      aconnector->dc_link->local_sink != NULL);
+
 	if (aconnector->base.force && new_connection_type == dc_connection_none) {
 		emulated_link_detect(aconnector->dc_link);
 
@@ -3899,7 +4010,34 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 
 		if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
 			drm_kms_helper_connector_hotplug_event(connector);
+	} else if (debounce_required) {
+		/*
+		 * HDMI disconnect detected - schedule delayed work instead of
+		 * processing immediately. This allows us to coalesce spurious
+		 * HDMI signals from physical unplugs.
+		 */
+		drm_dbg_kms(dev, "HDMI HPD: Disconnect detected, scheduling debounce work (%u ms)\n",
+			    aconnector->hdmi_hpd_debounce_delay_ms);
+
+		/* Cache the current sink for later comparison */
+		if (aconnector->hdmi_prev_sink)
+			dc_sink_release(aconnector->hdmi_prev_sink);
+		aconnector->hdmi_prev_sink = aconnector->dc_link->local_sink;
+		if (aconnector->hdmi_prev_sink)
+			dc_sink_retain(aconnector->hdmi_prev_sink);
+
+		/* Schedule delayed detection. */
+		if (mod_delayed_work(system_wq,
+				 &aconnector->hdmi_hpd_debounce_work,
+				 msecs_to_jiffies(aconnector->hdmi_hpd_debounce_delay_ms)))
+			drm_dbg_kms(dev, "HDMI HPD: Re-scheduled debounce work\n");
+
 	} else {
+
+		/* If the aconnector->hdmi_hpd_debounce_work is scheduled, exit early */
+		if (delayed_work_pending(&aconnector->hdmi_hpd_debounce_work))
+			return;
+
 		scoped_guard(mutex, &adev->dm.dc_lock) {
 			dc_exit_ips_for_hw_access(dc);
 			ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_HPD);
@@ -4925,6 +5063,21 @@ static void amdgpu_dm_backlight_set_level(struct amdgpu_display_manager *dm,
 	struct dc_link *link;
 	u32 brightness;
 	bool rc, reallow_idle = false;
+	struct drm_connector *connector;
+
+	list_for_each_entry(connector, &dm->ddev->mode_config.connector_list, head) {
+		struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
+
+		if (aconnector->bl_idx != bl_idx)
+			continue;
+
+		/* if connector is off, save the brightness for next time it's on */
+		if (!aconnector->base.encoder) {
+			dm->brightness[bl_idx] = user_brightness;
+			dm->actual_brightness[bl_idx] = 0;
+			return;
+		}
+	}
 
 	amdgpu_dm_update_backlight_caps(dm, bl_idx);
 	caps = &dm->backlight_caps[bl_idx];
@@ -5051,6 +5204,8 @@ amdgpu_dm_register_backlight_device(struct amdgpu_dm_connector *aconnector)
 	struct amdgpu_dm_backlight_caps *caps;
 	char bl_name[16];
 	int min, max;
+	int real_brightness;
+	int init_brightness;
 
 	if (aconnector->bl_idx == -1)
 		return;
@@ -5075,6 +5230,8 @@ amdgpu_dm_register_backlight_device(struct amdgpu_dm_connector *aconnector)
 	} else
 		props.brightness = props.max_brightness = MAX_BACKLIGHT_LEVEL;
 
+	init_brightness = props.brightness;
+
 	if (caps->data_points && !(amdgpu_dc_debug_mask & DC_DISABLE_CUSTOM_BRIGHTNESS_CURVE)) {
 		drm_info(drm, "Using custom brightness curve\n");
 		props.scale = BACKLIGHT_SCALE_NON_LINEAR;
@@ -5093,8 +5250,20 @@ amdgpu_dm_register_backlight_device(struct amdgpu_dm_connector *aconnector)
 	if (IS_ERR(dm->backlight_dev[aconnector->bl_idx])) {
 		drm_err(drm, "DM: Backlight registration failed!\n");
 		dm->backlight_dev[aconnector->bl_idx] = NULL;
-	} else
+	} else {
+		/*
+		 * dm->brightness[x] can be inconsistent just after startup until
+		 * ops.get_brightness is called.
+		 */
+		real_brightness =
+			amdgpu_dm_backlight_ops.get_brightness(dm->backlight_dev[aconnector->bl_idx]);
+
+		if (real_brightness != init_brightness) {
+			dm->actual_brightness[aconnector->bl_idx] = real_brightness;
+			dm->brightness[aconnector->bl_idx] = real_brightness;
+		}
 		drm_dbg_driver(drm, "DM: Registered Backlight device: %s\n", bl_name);
+	}
 }
 
 static int initialize_plane(struct amdgpu_display_manager *dm,
@@ -5403,7 +5572,8 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 
 				if (psr_feature_enabled) {
 					amdgpu_dm_set_psr_caps(link);
-					drm_info(adev_to_drm(adev), "PSR support %d, DC PSR ver %d, sink PSR ver %d DPCD caps 0x%x su_y_granularity %d\n",
+					drm_info(adev_to_drm(adev), "%s: PSR support %d, DC PSR ver %d, sink PSR ver %d DPCD caps 0x%x su_y_granularity %d\n",
+						 aconnector->base.name,
 						 link->psr_settings.psr_feature_enabled,
 						 link->psr_settings.psr_version,
 						 link->dpcd_caps.psr_info.psr_version,
@@ -7388,6 +7558,15 @@ static void amdgpu_dm_connector_destroy(struct drm_connector *connector)
 	if (aconnector->mst_mgr.dev)
 		drm_dp_mst_topology_mgr_destroy(&aconnector->mst_mgr);
 
+	/* Cancel and flush any pending HDMI HPD debounce work */
+	if (aconnector->hdmi_hpd_debounce_delay_ms) {
+		cancel_delayed_work_sync(&aconnector->hdmi_hpd_debounce_work);
+		if (aconnector->hdmi_prev_sink) {
+			dc_sink_release(aconnector->hdmi_prev_sink);
+			aconnector->hdmi_prev_sink = NULL;
+		}
+	}
+
 	if (aconnector->bl_idx != -1) {
 		backlight_device_unregister(dm->backlight_dev[aconnector->bl_idx]);
 		dm->backlight_dev[aconnector->bl_idx] = NULL;
@@ -8548,6 +8727,19 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
 	memset(&aconnector->vsdb_info, 0, sizeof(aconnector->vsdb_info));
 	mutex_init(&aconnector->hpd_lock);
 	mutex_init(&aconnector->handle_mst_msg_ready);
+
+	/*
+	 * If HDMI HPD debounce delay is set, use the minimum between selected
+	 * value and AMDGPU_DM_MAX_HDMI_HPD_DEBOUNCE_MS
+	 */
+	if (amdgpu_hdmi_hpd_debounce_delay_ms) {
+		aconnector->hdmi_hpd_debounce_delay_ms = min(amdgpu_hdmi_hpd_debounce_delay_ms,
+							     AMDGPU_DM_MAX_HDMI_HPD_DEBOUNCE_MS);
+		INIT_DELAYED_WORK(&aconnector->hdmi_hpd_debounce_work, hdmi_hpd_debounce_work);
+		aconnector->hdmi_prev_sink = NULL;
+	} else {
+		aconnector->hdmi_hpd_debounce_delay_ms = 0;
+	}
 
 	/*
 	 * configure support HPD hot plug connector_>polled default value is 0
@@ -10230,10 +10422,10 @@ static void dm_set_writeback(struct amdgpu_display_manager *dm,
 
 	wb_info->dwb_params.capture_rate = dwb_capture_rate_0;
 
-	wb_info->dwb_params.scaler_taps.h_taps = 4;
-	wb_info->dwb_params.scaler_taps.v_taps = 4;
-	wb_info->dwb_params.scaler_taps.h_taps_c = 2;
-	wb_info->dwb_params.scaler_taps.v_taps_c = 2;
+	wb_info->dwb_params.scaler_taps.h_taps = 1;
+	wb_info->dwb_params.scaler_taps.v_taps = 1;
+	wb_info->dwb_params.scaler_taps.h_taps_c = 1;
+	wb_info->dwb_params.scaler_taps.v_taps_c = 1;
 	wb_info->dwb_params.subsample_position = DWB_INTERSTITIAL_SUBSAMPLING;
 
 	wb_info->mcif_buf_params.luma_pitch = afb->base.pitches[0];
@@ -10533,7 +10725,7 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 			continue;
 		}
 		for (j = 0; j < status->plane_count; j++)
-			dummy_updates[j].surface = status->plane_states[0];
+			dummy_updates[j].surface = status->plane_states[j];
 
 		sort(dummy_updates, status->plane_count,
 		     sizeof(*dummy_updates), dm_plane_layer_index_cmp, NULL);
@@ -11249,6 +11441,8 @@ static bool should_reset_plane(struct drm_atomic_state *state,
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
 	struct dm_crtc_state *old_dm_crtc_state, *new_dm_crtc_state;
 	struct amdgpu_device *adev = drm_to_adev(plane->dev);
+	struct drm_connector_state *new_con_state;
+	struct drm_connector *connector;
 	int i;
 
 	/*
@@ -11258,6 +11452,15 @@ static bool should_reset_plane(struct drm_atomic_state *state,
 	if (amdgpu_ip_version(adev, DCE_HWIP, 0) < IP_VERSION(3, 2, 0) &&
 	    state->allow_modeset)
 		return true;
+
+	/* Check for writeback commit */
+	for_each_new_connector_in_state(state, connector, new_con_state, i) {
+		if (connector->connector_type != DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+
+		if (new_con_state->writeback_job)
+			return true;
+	}
 
 	if (amdgpu_in_reset(adev) && state->allow_modeset)
 		return true;
@@ -11435,7 +11638,7 @@ static int dm_check_cursor_fb(struct amdgpu_crtc *new_acrtc,
 	 * check tiling flags when the FB doesn't have a modifier.
 	 */
 	if (!(fb->flags & DRM_MODE_FB_MODIFIERS)) {
-		if (adev->family >= AMDGPU_FAMILY_GC_12_0_0) {
+		if (adev->family == AMDGPU_FAMILY_GC_12_0_0) {
 			linear = AMDGPU_TILING_GET(afb->tiling_flags, GFX12_SWIZZLE_MODE) == 0;
 		} else if (adev->family >= AMDGPU_FAMILY_AI) {
 			linear = AMDGPU_TILING_GET(afb->tiling_flags, SWIZZLE_MODE) == 0;
@@ -11857,10 +12060,9 @@ static int dm_crtc_get_cursor_mode(struct amdgpu_device *adev,
 
 	/* Overlay cursor not supported on HW before DCN
 	 * DCN401 does not have the cursor-on-scaled-plane or cursor-on-yuv-plane restrictions
-	 * as previous DCN generations, so enable native mode on DCN401 in addition to DCE
+	 * as previous DCN generations, so enable native mode on DCN401
 	 */
-	if (amdgpu_ip_version(adev, DCE_HWIP, 0) == 0 ||
-	    amdgpu_ip_version(adev, DCE_HWIP, 0) == IP_VERSION(4, 0, 1)) {
+	if (amdgpu_ip_version(adev, DCE_HWIP, 0) == IP_VERSION(4, 0, 1)) {
 		*cursor_mode = DM_CURSOR_NATIVE_MODE;
 		return 0;
 	}
@@ -12068,6 +12270,11 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 
 	if (dc_resource_is_dsc_encoding_supported(dc)) {
 		for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
+			dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+			dm_new_crtc_state->mode_changed_independent_from_dsc = new_crtc_state->mode_changed;
+		}
+
+		for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
 			if (drm_atomic_crtc_needs_modeset(new_crtc_state)) {
 				ret = add_affected_mst_dsc_crtcs(state, crtc);
 				if (ret) {
@@ -12180,6 +12387,12 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 		 * need to be added for DC to not disable a plane by mistake
 		 */
 		if (dm_new_crtc_state->cursor_mode == DM_CURSOR_OVERLAY_MODE) {
+			if (amdgpu_ip_version(adev, DCE_HWIP, 0) == 0) {
+				drm_dbg(dev, "Overlay cursor not supported on DCE\n");
+				ret = -EINVAL;
+				goto fail;
+			}
+
 			ret = drm_atomic_add_affected_planes(state, crtc);
 			if (ret)
 				goto fail;
@@ -12657,7 +12870,7 @@ static void parse_edid_displayid_vrr(struct drm_connector *connector,
 	u16 min_vfreq;
 	u16 max_vfreq;
 
-	if (edid == NULL || edid->extensions == 0)
+	if (!edid || !edid->extensions)
 		return;
 
 	/* Find DisplayID extension */
@@ -12667,7 +12880,7 @@ static void parse_edid_displayid_vrr(struct drm_connector *connector,
 			break;
 	}
 
-	if (edid_ext == NULL)
+	if (i == edid->extensions)
 		return;
 
 	while (j < EDID_LENGTH) {

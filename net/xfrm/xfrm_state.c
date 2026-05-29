@@ -592,6 +592,7 @@ void xfrm_state_free(struct xfrm_state *x)
 }
 EXPORT_SYMBOL(xfrm_state_free);
 
+static void xfrm_state_delete_tunnel(struct xfrm_state *x);
 static void xfrm_state_gc_destroy(struct xfrm_state *x)
 {
 	if (x->mode_cbs && x->mode_cbs->destroy_state)
@@ -607,6 +608,7 @@ static void xfrm_state_gc_destroy(struct xfrm_state *x)
 	kfree(x->replay_esn);
 	kfree(x->preplay_esn);
 	xfrm_unset_type_offload(x);
+	xfrm_state_delete_tunnel(x);
 	if (x->type) {
 		x->type->destructor(x);
 		xfrm_put_type(x->type);
@@ -806,7 +808,6 @@ void __xfrm_state_destroy(struct xfrm_state *x)
 }
 EXPORT_SYMBOL(__xfrm_state_destroy);
 
-static void xfrm_state_delete_tunnel(struct xfrm_state *x);
 int __xfrm_state_delete(struct xfrm_state *x)
 {
 	struct net *net = xs_net(x);
@@ -817,17 +818,17 @@ int __xfrm_state_delete(struct xfrm_state *x)
 
 		spin_lock(&net->xfrm.xfrm_state_lock);
 		list_del(&x->km.all);
-		hlist_del_rcu(&x->bydst);
-		hlist_del_rcu(&x->bysrc);
-		if (x->km.seq)
-			hlist_del_rcu(&x->byseq);
+		hlist_del_init_rcu(&x->bydst);
+		hlist_del_init_rcu(&x->bysrc);
+		if (!hlist_unhashed(&x->byseq))
+			hlist_del_init_rcu(&x->byseq);
 		if (!hlist_unhashed(&x->state_cache))
 			hlist_del_rcu(&x->state_cache);
 		if (!hlist_unhashed(&x->state_cache_input))
 			hlist_del_rcu(&x->state_cache_input);
 
-		if (x->id.spi)
-			hlist_del_rcu(&x->byspi);
+		if (!hlist_unhashed(&x->byspi))
+			hlist_del_init_rcu(&x->byspi);
 		net->xfrm.state_num--;
 		xfrm_nat_keepalive_state_updated(x);
 		spin_unlock(&net->xfrm.xfrm_state_lock);
@@ -2073,6 +2074,7 @@ static struct xfrm_state *xfrm_state_clone_and_setup(struct xfrm_state *orig,
 	return x;
 
  error:
+	x->km.state = XFRM_STATE_DEAD;
 	xfrm_state_put(x);
 out:
 	return NULL;
@@ -2157,11 +2159,15 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
 		xfrm_state_insert(xc);
 	} else {
 		if (xfrm_state_add(xc) < 0)
-			goto error;
+			goto error_add;
 	}
 
 	return xc;
+error_add:
+	if (xuo)
+		xfrm_dev_state_delete(xc);
 error:
+	xc->km.state = XFRM_STATE_DEAD;
 	xfrm_state_put(xc);
 	return NULL;
 }
@@ -2191,14 +2197,18 @@ int xfrm_state_update(struct xfrm_state *x)
 	}
 
 	if (x1->km.state == XFRM_STATE_ACQ) {
-		if (x->dir && x1->dir != x->dir)
+		if (x->dir && x1->dir != x->dir) {
+			to_put = x1;
 			goto out;
+		}
 
 		__xfrm_state_insert(x);
 		x = NULL;
 	} else {
-		if (x1->dir != x->dir)
+		if (x1->dir != x->dir) {
+			to_put = x1;
 			goto out;
+		}
 	}
 	err = 0;
 
@@ -2254,6 +2264,7 @@ out:
 
 		err = 0;
 		x->km.state = XFRM_STATE_DEAD;
+		xfrm_dev_state_delete(x);
 		__xfrm_state_put(x);
 	}
 
@@ -3141,6 +3152,7 @@ int __xfrm_init_state(struct xfrm_state *x, struct netlink_ext_ack *extack)
 	int err;
 
 	if (family == AF_INET &&
+	    (!x->dir || x->dir == XFRM_SA_DIR_OUT) &&
 	    READ_ONCE(xs_net(x)->ipv4.sysctl_ip_no_pmtu_disc))
 		x->props.flags |= XFRM_STATE_NOPMTUDISC;
 
@@ -3298,6 +3310,7 @@ out_bydst:
 void xfrm_state_fini(struct net *net)
 {
 	unsigned int sz;
+	int i;
 
 	flush_work(&net->xfrm.state_hash_work);
 	xfrm_state_flush(net, 0, false);
@@ -3305,14 +3318,17 @@ void xfrm_state_fini(struct net *net)
 
 	WARN_ON(!list_empty(&net->xfrm.state_all));
 
+	for (i = 0; i <= net->xfrm.state_hmask; i++) {
+		WARN_ON(!hlist_empty(net->xfrm.state_byseq + i));
+		WARN_ON(!hlist_empty(net->xfrm.state_byspi + i));
+		WARN_ON(!hlist_empty(net->xfrm.state_bysrc + i));
+		WARN_ON(!hlist_empty(net->xfrm.state_bydst + i));
+	}
+
 	sz = (net->xfrm.state_hmask + 1) * sizeof(struct hlist_head);
-	WARN_ON(!hlist_empty(net->xfrm.state_byseq));
 	xfrm_hash_free(net->xfrm.state_byseq, sz);
-	WARN_ON(!hlist_empty(net->xfrm.state_byspi));
 	xfrm_hash_free(net->xfrm.state_byspi, sz);
-	WARN_ON(!hlist_empty(net->xfrm.state_bysrc));
 	xfrm_hash_free(net->xfrm.state_bysrc, sz);
-	WARN_ON(!hlist_empty(net->xfrm.state_bydst));
 	xfrm_hash_free(net->xfrm.state_bydst, sz);
 	free_percpu(net->xfrm.state_cache_input);
 }

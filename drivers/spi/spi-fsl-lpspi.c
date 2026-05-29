@@ -486,7 +486,13 @@ static int fsl_lpspi_setup_transfer(struct spi_controller *controller,
 		fsl_lpspi->tx = fsl_lpspi_buf_tx_u32;
 	}
 
-	fsl_lpspi->watermark = min_t(typeof(fsl_lpspi->watermark),
+	/*
+	 * t->len is 'unsigned' and txfifosize and watermrk is 'u8', force
+	 * type cast is inevitable. When len > 255, len will be truncated in min_t(),
+	 * it caused wrong watermark set. 'unsigned int' is as the designated type
+	 * for min_t() to avoid truncation.
+	 */
+	fsl_lpspi->watermark = min_t(unsigned int,
 				     fsl_lpspi->txfifosize,
 				     t->len);
 
@@ -966,7 +972,7 @@ static int fsl_lpspi_probe(struct platform_device *pdev)
 		enable_irq(irq);
 	}
 
-	ret = devm_spi_register_controller(&pdev->dev, controller);
+	ret = spi_register_controller(controller);
 	if (ret < 0) {
 		dev_err_probe(&pdev->dev, ret, "spi_register_controller error\n");
 		goto free_dma;
@@ -992,6 +998,7 @@ static void fsl_lpspi_remove(struct platform_device *pdev)
 	struct fsl_lpspi_data *fsl_lpspi =
 				spi_controller_get_devdata(controller);
 
+	spi_unregister_controller(controller);
 	fsl_lpspi_dma_exit(controller);
 
 	pm_runtime_dont_use_autosuspend(fsl_lpspi->dev);
